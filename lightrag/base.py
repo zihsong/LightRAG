@@ -164,6 +164,7 @@ class DocStatus(str, Enum):
     PROCESSING = "processing"
     PROCESSED = "processed"
     FAILED = "failed"
+    RETRY_FAILED = "retry_failed"
 
 
 @dataclass

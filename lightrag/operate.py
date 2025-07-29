@@ -1,8 +1,10 @@
 import asyncio
+import csv
+import io
 import json
 import re
 from tqdm.asyncio import tqdm as tqdm_async
-from typing import Any, Union
+from typing import Any, List, Union
 from collections import Counter, defaultdict
 from .utils import (
     logger,
@@ -956,6 +958,36 @@ async def mix_kg_vector_query(
     (kg_context, kg_chunks), (vector_context, vec_chunks) = await asyncio.gather(
         get_kg_context(), get_vector_context()
     )
+    def csv_string_to_list(csv_string: str) -> List[List[str]]:
+        # Clean the string by removing NUL characters
+        cleaned_string = csv_string.replace("\0", "")
+
+        output = io.StringIO(cleaned_string)
+        reader = csv.reader(
+            output,
+            quoting=csv.QUOTE_ALL,  # Match the writer configuration
+            escapechar="\\",  # Use backslash as escape character
+            quotechar='"',  # Use double quotes
+        )
+
+        try:
+            return [row for row in reader]
+        except csv.Error as e:
+            raise ValueError(f"Failed to parse CSV string: {str(e)}")
+        finally:
+            output.close()
+    references = []
+
+    if kg_chunks:
+        for c in csv_string_to_list(kg_chunks)[1:]:
+            if len(c) >= 2:
+                references.append(c[1].lstrip('\t'))
+
+    if vec_chunks:
+        for c in vec_chunks:
+            references.append(c['content'])
+    references = list(set(references))
+    references_str = "\n".join([f"[{i+1}] {ref}" for i, ref in enumerate(references)])
 
     # 4. Merge contexts
     if kg_context is None and vector_context is None:
@@ -965,13 +997,8 @@ async def mix_kg_vector_query(
         return {"kg_context": kg_context, "vector_context": vector_context}, None
 
     # 5. Construct hybrid prompt
-    sys_prompt = PROMPTS["mix_rag_response"].format(
-        kg_context=kg_context
-        if kg_context
-        else "No relevant knowledge graph information found",
-        vector_context=vector_context
-        if vector_context
-        else "No relevant text information found",
+    sys_prompt = PROMPTS["mix_rag_response_simplified"].format(
+        references=references_str,
         response_type=query_param.response_type,
         history=history_context,
     )
@@ -1013,7 +1040,7 @@ async def mix_kg_vector_query(
             ),
         )
 
-    return response, (kg_chunks, vec_chunks)
+    return response, (kg_chunks, references)
 
 
 async def _build_query_context(

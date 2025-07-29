@@ -532,28 +532,34 @@ class LightRAG:
         """
         # 1. get all pending and failed documents
         to_process_docs: dict[str, DocProcessingStatus] = {}
+        retry_docs: dict[str, DocProcessingStatus] = {}
 
         # Fetch failed documents
         failed_docs = await self.doc_status.get_failed_docs()
-        to_process_docs.update(failed_docs)
+        retry_docs.update(failed_docs)
         pendings_docs = await self.doc_status.get_pending_docs()
         to_process_docs.update(pendings_docs)
 
-        if not to_process_docs:
+        if not to_process_docs and not retry_docs:
             logger.info("All documents have been processed or are duplicates")
             return
 
         # 2. split docs into chunks, insert chunks, update doc status
         batch_size = self.addon_params.get("insert_batch_size", 10)
-        docs_batches = [
+        docs_batches_to_process = [
             list(to_process_docs.items())[i : i + batch_size]
             for i in range(0, len(to_process_docs), batch_size)
         ]
+        docs_batches_to_retry = [
+            list(retry_docs.items())[i : i + batch_size]
+            for i in range(0, len(retry_docs), batch_size)
+        ]
 
-        logger.info(f"Number of batches to process: {len(docs_batches)}.")
+        logger.info(f"Number of batches to process: {len(docs_batches_to_process)}.")
+        logger.info(f"Number of batches to retry: {len(docs_batches_to_retry)}.")
 
         # 3. iterate over batches
-        for batch_idx, docs_batch in enumerate(docs_batches):
+        for batch_idx, docs_batch in enumerate(docs_batches_to_process):
             # 4. iterate over batch
             for doc_id_processing_status in docs_batch:
                 doc_id, status_doc = doc_id_processing_status
@@ -616,11 +622,93 @@ class LightRAG:
                                 "status": DocStatus.FAILED,
                                 "error": str(e),
                                 "updated_at": datetime.now().isoformat(),
+                                "content": status_doc.content,
+                                "content_summary": status_doc.content_summary,
+                                "content_length": status_doc.content_length,
+                                "created_at": status_doc.created_at,
+                                "metadata": status_doc.metadata
                             }
                         }
                     )
                     continue
-            logger.info(f"Completed batch {batch_idx + 1} of {len(docs_batches)}.")
+            
+        for batch_idx, docs_batch in enumerate(docs_batches_to_retry):
+            # 4. iterate over batch
+            for doc_id_processing_status in docs_batch:
+                doc_id, status_doc = doc_id_processing_status
+                # Update status in processing
+                doc_status_id = compute_mdhash_id(status_doc.content, prefix="doc-")
+                await self.doc_status.upsert(
+                    {
+                        doc_status_id: {
+                            "status": DocStatus.PROCESSING,
+                            "updated_at": datetime.now().isoformat(),
+                            "content_summary": status_doc.content_summary,
+                            "content_length": status_doc.content_length,
+                            "created_at": status_doc.created_at,
+                            "metadata": status_doc.metadata
+                        }
+                    }
+                )
+                # Generate chunks from document
+                chunks: dict[str, Any] = {
+                    compute_mdhash_id(dp["content"], prefix="chunk-"): {
+                        **dp,
+                        "full_doc_id": doc_id,
+                        "metadata": status_doc.metadata
+                    }
+                    for dp in self.chunking_func(
+                        status_doc.content,
+                        split_by_character,
+                        split_by_character_only,
+                        self.chunk_overlap_token_size,
+                        self.chunk_token_size,
+                        self.tiktoken_model_name,
+                    )
+                }
+
+                # Process document (text chunks and full docs) in parallel
+                tasks = [
+                    self.chunks_vdb.upsert(chunks),
+                    self._process_entity_relation_graph(chunks),
+                    self.full_docs.upsert({doc_id: {"content": status_doc.content, "metadata": status_doc.metadata}}),
+                    self.text_chunks.upsert(chunks),
+                ]
+                try:
+                    await asyncio.gather(*tasks)
+                    await self.doc_status.upsert(
+                        {
+                            doc_status_id: {
+                                "status": DocStatus.PROCESSED,
+                                "chunks_count": len(chunks),
+                                "updated_at": datetime.now().isoformat(),
+                            }
+                        }
+                    )
+                    await self._insert_done()
+                    print(f"Retry success to process document {doc_id}")
+
+                except Exception as e:
+                    logger.error(f"Failed to process document {doc_id}: {str(e)}")
+                    print()
+                    print(f"Retry failed to process document {doc_id}: {str(e)}. \n full content: {status_doc.content}")
+                    await self.doc_status.upsert(
+                        {
+                            doc_status_id: {
+                                "status": DocStatus.RETRY_FAILED,
+                                "error": str(e),
+                                "updated_at": datetime.now().isoformat(),
+                                "content": status_doc.content,
+                                "content_summary": status_doc.content_summary,
+                                "content_length": status_doc.content_length,
+                                "created_at": status_doc.created_at,
+                                "metadata": status_doc.metadata
+                            }
+                        }
+                    )
+                    continue
+
+            logger.info(f"Completed batch {batch_idx + 1} of {len(docs_batches_to_process)}.")
 
     async def _process_entity_relation_graph(self, chunk: dict[str, Any]) -> None:
         try:
