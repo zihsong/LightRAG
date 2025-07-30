@@ -689,10 +689,35 @@ async def kg_query(
         history_context = get_conversation_turns(
             query_param.conversation_history, query_param.history_turns
         )
+    def csv_string_to_list(csv_string: str) -> List[List[str]]:
+        # Clean the string by removing NUL characters
+        cleaned_string = csv_string.replace("\0", "")
 
-    sys_prompt_temp = prompt if prompt else PROMPTS["rag_response"]
+        output = io.StringIO(cleaned_string)
+        reader = csv.reader(
+            output,
+            quoting=csv.QUOTE_ALL,  # Match the writer configuration
+            escapechar="\\",  # Use backslash as escape character
+            quotechar='"',  # Use double quotes
+        )
+
+        try:
+            return [row for row in reader]
+        except csv.Error as e:
+            raise ValueError(f"Failed to parse CSV string: {str(e)}")
+        finally:
+            output.close()
+
+    references = []
+    if chunks:
+        for c in csv_string_to_list(chunks)[1:]:
+            if len(c) >= 2: 
+                references.append(c[1].lstrip('\t'))
+    references_str = "\n".join([f"[{i+1}] {ref}" for i, ref in enumerate(references)])
+
+    sys_prompt_temp = prompt if prompt else PROMPTS["mix_rag_response_simplified"]
     sys_prompt = sys_prompt_temp.format(
-        context_data=context,
+        references=references_str,
         response_type=query_param.response_type,
         history=history_context,
     )
@@ -730,7 +755,7 @@ async def kg_query(
             cache_type="query",
         ),
     )
-    return response, chunks
+    return response, references
 
 
 async def extract_keywords_only(
@@ -1638,6 +1663,9 @@ async def naive_query(
     logger.info(f"Truncate {len(chunks)} to {len(maybe_trun_chunks)} chunks")
     section = "\n--New Chunk--\n".join([c["content"] for c in maybe_trun_chunks])
 
+    references = [c["content"] for c in maybe_trun_chunks]
+    references_str = "\n".join([f"[{i+1}] {ref}" for i, ref in enumerate(references)])
+
     if query_param.only_need_context:
         return section, None
 
@@ -1648,9 +1676,9 @@ async def naive_query(
             query_param.conversation_history, query_param.history_turns
         )
 
-    sys_prompt_temp = PROMPTS["naive_rag_response"]
+    sys_prompt_temp = PROMPTS["mix_rag_response_simplified"]
     sys_prompt = sys_prompt_temp.format(
-        content_data=section,
+        references=references_str,
         response_type=query_param.response_type,
         history=history_context,
     )
@@ -1691,7 +1719,7 @@ async def naive_query(
         ),
     )
 
-    return response, maybe_trun_chunks
+    return response, references
 
 
 async def kg_query_with_keywords(
