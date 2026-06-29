@@ -160,6 +160,9 @@ async def openai_complete_if_cache(
         async def inner():
             try:
                 async for chunk in response:
+                    if not chunk.choices:
+                        # 跳过 usage 收尾等不含 choices 的空 chunk
+                        continue
                     content = chunk.choices[0].delta.content
                     if content is None:
                         continue
